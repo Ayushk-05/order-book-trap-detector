@@ -39,3 +39,4 @@ This tool identifies and visualizes:
 
 ```bash
 pip install streamlit pandas plotly ccxt streamlit-autorefresh
+streamlit run app1.py
