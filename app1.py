@@ -1,21 +1,21 @@
+
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 import ccxt
 from streamlit_autorefresh import st_autorefresh
 from datetime import datetime
-from collections import defaultdict   # <-- Added for executed wall tracking
+from collections import defaultdict
 
 # --- Config ---
 st.set_page_config(layout="wide")
-st.title("🚨 Order Book Trap Detection – DOGE/USDT (Smart Refresh)")
+st.title("🚨 Order Book Wall & Trap Monitor (Smart Refresh)")
 st_autorefresh(interval=10 * 1000, key="refresh")
 
 # --- Exchange Setup ---
 exchange = ccxt.binance()
-symbol = 'DOGE/USDT'
-limit = 100
-spoof_threshold = 500000
+symbols = exchange.load_markets()
+usdt_pairs = sorted([s for s in symbols if s.endswith("/USDT") and symbols[s]['active']])
 
 # --- Session State ---
 state = st.session_state
@@ -23,8 +23,24 @@ if "prev_bids" not in state: state.prev_bids = None
 if "prev_asks" not in state: state.prev_asks = None
 if "prev_price" not in state: state.prev_price = None
 if "signal_cache" not in state: state.signal_cache = []
-if "prev_walls" not in state:   # <-- Added for executed wall tracking
+if "prev_walls" not in state: state.prev_walls = {'buy': defaultdict(int), 'sell': defaultdict(int)}
+if "last_symbol" not in state: state.last_symbol = "DOGE/USDT"
+if "tracked_walls" not in state: state.tracked_walls = {'buy': {}, 'sell': {}}  # <-- Persistent huge walls
+
+# --- Symbol Dropdown with Reset Logic ---
+symbol = st.selectbox("📊 Select USDT Trading Pair", usdt_pairs, index=usdt_pairs.index(state.last_symbol))
+if symbol != state.last_symbol:
+    state.prev_bids = None
+    state.prev_asks = None
+    state.prev_price = None
+    state.signal_cache = []
     state.prev_walls = {'buy': defaultdict(int), 'sell': defaultdict(int)}
+    state.tracked_walls = {'buy': {}, 'sell': {}}  # Reset tracked walls on symbol change
+    state.last_symbol = symbol
+
+# --- Parameters ---
+limit = 100
+spoof_threshold = 500000
 
 # --- Fetch Data ---
 depth = exchange.fetch_order_book(symbol, limit=limit)
@@ -41,7 +57,24 @@ asks = asks.sort_values('price')
 bids['cumulative_quantity'] = bids['quantity'].cumsum()
 asks['cumulative_quantity'] = asks['quantity'].cumsum()
 
-# --- Spoof Detection ---
+# --- Track Huge Walls Persistently ---
+def track_walls(df, side):
+    updated = []
+    tracked = state.tracked_walls[side]
+    for _, row in df.iterrows():
+        price, qty = float(row['price']), float(row['quantity'])
+        if qty > spoof_threshold:
+            if price not in tracked or qty > tracked[price]:
+                tracked[price] = qty
+                updated.append(f"🧱 NEW {'BUY' if side == 'buy' else 'SELL'} WALL at ${price:.4f} – Qty: {int(qty)}")
+    # Remove walls that disappeared or shrunk significantly
+    for price in list(tracked.keys()):
+        match = df[df['price'] == price]
+        if match.empty or float(match['quantity'].values[0]) < spoof_threshold * 0.2:
+            del tracked[price]
+    return updated
+
+# --- Detection Functions ---
 def detect_spoof(current, previous, side):
     signals = []
     if previous is None: return signals
@@ -54,12 +87,6 @@ def detect_spoof(current, previous, side):
                 signals.append(f"Spoof on {side.upper()} at ${price:.4f} → {int(prev_qty)} → {int(curr_qty)}")
     return signals
 
-# --- Wall Detection ---
-def detect_walls(df):
-    return [f"🧱 {row['side'].upper()} Wall at ${row['price']:.4f} – Qty: {int(row['quantity'])}" 
-            for _, row in df.iterrows() if row['quantity'] > spoof_threshold]
-
-# --- Trap Detection ---
 def detect_traps(spoofs, prev_price, curr_price):
     traps = []
     for s in spoofs:
@@ -69,7 +96,6 @@ def detect_traps(spoofs, prev_price, curr_price):
             traps.append(f"🚨 Bear Trap: {s}")
     return traps
 
-# --- Absorption Detection ---
 def detect_absorption(bids, asks):
     if bids.iloc[0]['quantity'] > spoof_threshold:
         return f"🛡️ Buyer Absorption at ${bids.iloc[0]['price']:.4f}"
@@ -77,60 +103,63 @@ def detect_absorption(bids, asks):
         return f"🛡️ Seller Absorption at ${asks.iloc[0]['price']:.4f}"
     return ""
 
-# --- Executed Wall Detection (NEW) ---
 def detect_executed_walls(current, previous, side):
     executed = []
-    # Track current walls
     curr_walls = {row['price']: row['quantity'] 
-                 for _, row in current.iterrows() 
-                 if row['quantity'] > spoof_threshold}
-    # Compare with previous walls
+                  for _, row in current.iterrows() 
+                  if row['quantity'] > spoof_threshold}
     for prev_price, prev_qty in state.prev_walls[side].items():
         curr_qty = curr_walls.get(prev_price, 0)
-        # Consider executed if >80% filled
         if prev_qty > spoof_threshold and curr_qty < prev_qty * 0.2:
-            executed.append(
-                f"✅ Executed {side.upper()} Wall at ${prev_price:.4f} (Was {int(prev_qty)}, Now {int(curr_qty)})"
-            )
-    # Update previous walls tracking
+            executed.append(f"✅ Executed {side.upper()} Wall at ${prev_price:.4f} (Was {int(prev_qty)}, Now {int(curr_qty)})")
     state.prev_walls[side] = defaultdict(int, curr_walls)
     return executed
 
-# --- Generate New Signals ---
+# --- Generate Signals ---
 spoofs = detect_spoof(bids, state.prev_bids, "buy") + detect_spoof(asks, state.prev_asks, "sell")
-walls = detect_walls(pd.concat([bids, asks]))
 traps = detect_traps(spoofs, prev_price, current_price) if prev_price else []
 absorption = detect_absorption(bids, asks)
+executed_walls = detect_executed_walls(bids, state.prev_bids, 'buy') + detect_executed_walls(asks, state.prev_asks, 'sell')
+new_buy_walls = track_walls(bids, 'buy')
+new_sell_walls = track_walls(asks, 'sell')
 
-# --- Executed Wall Signals (NEW) ---
-executed_walls = (
-    detect_executed_walls(bids, state.prev_bids, 'buy') +
-    detect_executed_walls(asks, state.prev_asks, 'sell')
-)
-
-new_signals = spoofs + traps + walls + executed_walls   # <-- Add executed walls to signals
+new_signals = spoofs + traps + new_buy_walls + new_sell_walls + executed_walls
 if absorption: new_signals.append(absorption)
-
-# --- Smart Update: Only overwrite if meaningful new signal
 if new_signals:
-    state.signal_cache = new_signals  # persist only if there's something new
+    state.signal_cache = new_signals
 
-# --- Show Persistent Signal Panel ---
-st.markdown("## 🔍 **Manipulation & Trap Signals (Persistent)**")
+# --- Visual Summary of Wall Dominance ---
+def get_top_wall(walls):
+    return max(walls.items(), key=lambda x: x[1]) if walls else ("-", 0)
+
+buy_top_price, buy_top_qty = get_top_wall(state.tracked_walls['buy'])
+sell_top_price, sell_top_qty = get_top_wall(state.tracked_walls['sell'])
+
+st.markdown("## 📊 **Current Wall Summary**")
+st.markdown(f"🟩 **Buy Wall**: ${buy_top_price} – {int(buy_top_qty):,}")
+st.markdown(f"🟥 **Sell Wall**: ${sell_top_price} – {int(sell_top_qty):,}")
+
+if buy_top_qty > sell_top_qty:
+    st.success("📈 Dominant Pressure: **BUY SIDE**")
+elif sell_top_qty > buy_top_qty:
+    st.error("📉 Dominant Pressure: **SELL SIDE**")
+else:
+    st.info("🔄 Balanced Order Book")
+
+# --- Display Signals ---
+st.markdown("## 🔍 **Order Book Signals (Persistent)**")
 if state.signal_cache:
     for signal in state.signal_cache:
         if "Trap" in signal:
             st.error(signal)
         elif "Spoof" in signal:
             st.warning("⚠️ " + signal)
-        elif "Wall" in signal:
+        elif "WALL" in signal:
             st.info(signal)
-        elif "Absorption" in signal:
-            st.success(signal)
-        elif "Executed" in signal:    # <-- Display executed walls as success
+        elif "Absorption" in signal or "Executed" in signal:
             st.success(signal)
 else:
-    st.info("📡 Waiting for meaningful manipulation...")
+    st.info("📡 Waiting for signals...")
 
 # --- Charts ---
 fig_bids = go.Figure()
